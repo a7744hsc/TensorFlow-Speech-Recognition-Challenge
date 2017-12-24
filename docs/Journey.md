@@ -58,4 +58,6 @@ done
         
     - For now, I decide to use the background noise as silence and some other labels as unknown.
     
-3.  Mimic the TF tutorial, rewrite it into a simpler version.
+3.  Mimic the TF tutorial, rewrite it into a simpler version. 
+    - rewrite the code with the simplest strategy and short training loop, just to make sure the whole process works fine. 
+    With my first submission, I got a 0.28 accuracy which is really low.
