@@ -9,9 +9,8 @@ import models
 NOISE_FOLDER = '_background_noise_'
 DATA_DIR = '/tmp/speech_dataset/'
 
-test_list = ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go", "silence", "unknown"];
 is_training = True
-batch_size= 100
+batch_size_global = 100
 training_steps_list = [15000, 3000]
 learning_rates_list = [0.001, 0.0001]
 # silence testing unknown validation 百分比都是10
@@ -32,9 +31,10 @@ model_settings = {
         'sample_rate': 16000,
     }
 
-whole_words = ['_silence_', '_unknown_', 'yes', 'no', 'up', 'down', 'left', 'right', 'on', 'off', 'stop', 'go']
-word_to_index = {'_silence_':0, '_unknown_':1 , 'yes': 2, 'no': 3, 'up': 4, 'down': 5, 'left': 6, 'right': 7, 'on': 8, 'off': 9, 'stop': 10,
-                      'go': 11}
+whole_words = ['silence', 'unknown', 'yes', 'no', 'up', 'down', 'left', 'right', 'on', 'off', 'stop', 'go']
+word_to_index = {'silence':0, 'unknown':1 , 'yes': 2, 'no': 3, 'up': 4, 'down': 5, 'left': 6, 'right': 7, 'on': 8, 'off': 9, 'stop': 10, 'go': 11}
+
+index_to_word = {0: 'silence', 1: 'unknown', 2: 'yes', 3: 'no', 4: 'up', 5: 'down', 6: 'left', 7: 'right', 8: 'on', 9: 'off', 10: 'stop', 11: 'go'}
 
 
 
@@ -94,7 +94,7 @@ def run(args):
                 learning_rate_value = learning_rates_list[i]
                 break
 
-        train_fingerprints, train_ground_truth = generate_data(background_data, background_data_placeholder_,
+        train_fingerprints, train_ground_truth,_ = generate_data(background_data, background_data_placeholder_,
                                                                background_volume_placeholder_, data_index,
                                                                foreground_volume_placeholder_, mfcc_, sess,
                                                                time_shift_offset_placeholder_,
@@ -117,6 +117,79 @@ def run(args):
                         (training_step, learning_rate_value, train_accuracy * 100,
                          cross_entropy_value))
 
+        is_last_step = (training_step == training_steps_max)
+        if (training_step % 100) == 0 or is_last_step:
+            set_size = len(data_index['validation'])
+            total_accuracy = 0
+            for i in range(0, set_size, batch_size_global):
+                validation_fingerprints, validation_ground_truth,_ = generate_data(background_data, background_data_placeholder_,
+                                                                       background_volume_placeholder_, data_index,
+                                                                       foreground_volume_placeholder_, mfcc_, sess,
+                                                                       time_shift_offset_placeholder_,
+                                                                       time_shift_padding_placeholder_,
+                                                                       time_shift_samples,
+                                                                       wav_filename_placeholder_, "validation")
+                # Run a validation step and capture training summaries for TensorBoard
+                # with the `merged` op.
+                validation_summary, validation_accuracy = sess.run(
+                    [merged_summaries, evaluation_step],
+                    feed_dict={
+                        fingerprint_input: validation_fingerprints,
+                        ground_truth_input: validation_ground_truth,
+                        dropout_prob: 1.0
+                    })
+                validation_writer.add_summary(validation_summary, training_step)
+                actural_size = min(batch_size_global, set_size - i)
+                total_accuracy += (validation_accuracy * actural_size) / set_size
+            tf.logging.info('Step %d: Validation accuracy = %.1f%% (N=%d)' %
+                            (training_step, total_accuracy * 100, set_size))
+
+
+    #########get result after training
+    test_set_size = len(data_index['testing'])
+    tf.logging.info('test_set_size=%d', test_set_size)
+    total_accuracy = 0
+    for i in range(0, set_size, batch_size_global):
+        test_fingerprints, test_ground_truth,filenames = generate_data(background_data, background_data_placeholder_,
+                                                                     background_volume_placeholder_, data_index,
+                                                                     foreground_volume_placeholder_, mfcc_, sess,
+                                                                     time_shift_offset_placeholder_,
+                                                                     time_shift_padding_placeholder_,
+                                                                     time_shift_samples,
+                                                                     wav_filename_placeholder_, "testing")
+        test_accuracy = sess.run(
+            evaluation_step,
+            feed_dict={
+                fingerprint_input: test_fingerprints,
+                ground_truth_input: test_ground_truth,
+                dropout_prob: 1.0
+            })
+        actual_size = min(batch_size_global, set_size - i)
+        total_accuracy += (test_accuracy * actual_size) / set_size
+    tf.logging.info('Final test accuracy = %.1f%% (N=%d)' % (total_accuracy * 100,
+                                                             set_size))
+
+    pred_fingerprints, _, filenames = generate_data(background_data, background_data_placeholder_,
+                                                                    background_volume_placeholder_, data_index,
+                                                                    foreground_volume_placeholder_, mfcc_, sess,
+                                                                    time_shift_offset_placeholder_,
+                                                                    time_shift_padding_placeholder_,
+                                                                    time_shift_samples,
+                                                                    wav_filename_placeholder_, "pred")
+    predictions = sess.run(
+        predicted_indices,
+        feed_dict={
+            fingerprint_input: pred_fingerprints,
+            dropout_prob: 1.0
+        })
+
+    print("prediction lengh is",len(predictions))
+    print("file lengh is",len(filenames))
+
+    f = open("/tmp/predictions.txt","w")
+    for f_name,result in zip(filenames,predictions):
+        f.write(os.path.basename(f_name)+","+index_to_word[result]+"\n")
+    f.close()
 
 def generate_data(background_data, background_data_placeholder_, background_volume_placeholder_, data_index,
                   foreground_volume_placeholder_, mfcc_, sess, time_shift_offset_placeholder_,
@@ -124,17 +197,28 @@ def generate_data(background_data, background_data_placeholder_, background_volu
     ####################### Pull the audio samples we'll use for training.
     background_volume_range = 0.1
     background_frequency = 0.8
+    use_background = (mode == 'training')
     # Pick one of the partitions to choose samples from.
-    candidates = data_index[mode]
+    batch_size = batch_size_global
+    if mode == 'pred':
+        candidates=[];
+        for wav_path in tf.gfile.Glob('/tmp/test/audio/*.wav'):
+            candidates.append({'label': 'go', 'file': wav_path })
+        batch_size = len(candidates)
+    else:
+        candidates = data_index[mode]
     # Data and labels will be populated and returned.
     data = np.zeros((batch_size, model_settings['fingerprint_size']))
     labels = np.zeros(batch_size)
+    filenames = []
     desired_samples = model_settings['desired_samples']
-    use_background = True  # self.background_data and (mode == 'training')
-    pick_deterministically = False  # (mode != 'training')
+    pick_deterministically = (mode != 'training')
     for i in range(batch_size):
-        sample_index = np.random.randint(len(candidates))
-        sample = candidates[sample_index]
+        if pick_deterministically:
+            sample=candidates[i]
+        else:
+            sample_index = np.random.randint(len(candidates))
+            sample = candidates[sample_index]
         # If we're time shifting, set up the offset for this sample.
         time_shift_amount = np.random.randint(-time_shift_samples, time_shift_samples)
 
@@ -168,7 +252,7 @@ def generate_data(background_data, background_data_placeholder_, background_volu
         input_dict[background_data_placeholder_] = background_reshaped
         input_dict[background_volume_placeholder_] = background_volume
         # If we want silence, mute out the main sample but leave the background.
-        if sample['label'] == '_silence_':
+        if sample['label'] == 'silence':
             input_dict[foreground_volume_placeholder_] = 0
         else:
             input_dict[foreground_volume_placeholder_] = 1
@@ -176,7 +260,8 @@ def generate_data(background_data, background_data_placeholder_, background_volu
         data[i, :] = sess.run(mfcc_, feed_dict=input_dict).flatten()
         label_index = word_to_index[sample['label']]
         labels[i] = label_index
-    return data, labels
+        filenames.append(sample['file'])
+    return data, labels,filenames
 
 
 # 数据处理
@@ -196,15 +281,15 @@ def generate_dataset():
         percentage_hash = ((int(hash_name_hashed, 16) % (2 ** 20 + 1)) * (100.0 / 2 ** 20))
         if percentage_hash < validation_percentage:
             set_index = 'validation'
-        elif percentage_hash < testing_percentage:
+        elif percentage_hash < testing_percentage+validation_percentage:
             set_index = 'testing'
         else:
             set_index = 'training'
 
         if label in whole_words:
-            data_index[set_index].append({'label': label, 'file': wav_path})
+            data_index[set_index].append({'label': label, 'file': wav_path,})
         else:
-            unknown_index[set_index].append({'label': '_unknown_', 'file': wav_path})
+            unknown_index[set_index].append({'label': 'unknown', 'file': wav_path})
 
     # We need an arbitrary file to load as the input for the silence samples.
     # It's multiplied by zero later, so the content doesn't matter.
@@ -214,7 +299,7 @@ def generate_dataset():
         silence_size = int(math.ceil(set_size * silence_percentage / 100))
         for _ in range(silence_size):
             data_index[set_index].append({
-                'label': '_silence_',
+                'label': 'silence',
                 'file': silence_wav_path
             })
 
@@ -300,39 +385,4 @@ if __name__ == '__main__':
 
 
 
-        # is_last_step = (training_step == training_steps_max)
-        # if (training_step % 100) == 0 or is_last_step:
-        #     set_size = audio_processor.set_size('validation')
-        #     total_accuracy = 0
-        #     total_conf_matrix = None
-        #     for i in xrange(0, set_size, FLAGS.batch_size):
-        #         validation_fingerprints, validation_ground_truth = (
-        #             audio_processor.get_data(FLAGS.batch_size, i, model_settings, 0.0,
-        #                                      0.0, 0, 'validation', sess))
-        #         # Run a validation step and capture training summaries for TensorBoard
-        #         # with the `merged` op.
-        #         validation_summary, validation_accuracy, conf_matrix = sess.run(
-        #             [merged_summaries, evaluation_step, confusion_matrix],
-        #             feed_dict={
-        #                 fingerprint_input: validation_fingerprints,
-        #                 ground_truth_input: validation_ground_truth,
-        #                 dropout_prob: 1.0
-        #             })
-        #         validation_writer.add_summary(validation_summary, training_step)
-        #         batch_size = min(FLAGS.batch_size, set_size - i)
-        #         total_accuracy += (validation_accuracy * batch_size) / set_size
-        #         if total_conf_matrix is None:
-        #             total_conf_matrix = conf_matrix
-        #         else:
-        #             total_conf_matrix += conf_matrix
-        #     tf.logging.info('Confusion Matrix:\n %s' % (total_conf_matrix))
-        #     tf.logging.info('Step %d: Validation accuracy = %.1f%% (N=%d)' %
-        #                     (training_step, total_accuracy * 100, set_size))
-        #
-        # # Save the model checkpoint periodically.
-        # if (training_step % FLAGS.save_step_interval == 0 or
-        #         training_step == training_steps_max):
-        #     checkpoint_path = os.path.join(FLAGS.train_dir,
-        #                                    FLAGS.model_architecture + '.ckpt')
-        #     tf.logging.info('Saving to "%s-%d"', checkpoint_path, training_step)
-        #     saver.save(sess, checkpoint_path, global_step=training_step)
+
