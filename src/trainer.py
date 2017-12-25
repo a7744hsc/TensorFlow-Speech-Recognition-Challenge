@@ -1,4 +1,6 @@
 import os, re, random, argparse, hashlib, math
+
+from datetime import datetime as dt
 from tensorflow.python.util import compat
 import tensorflow as tf
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
@@ -7,18 +9,19 @@ import numpy as np
 import models
 
 NOISE_FOLDER = '_background_noise_'
-DATA_DIR = '/tmp/speech_dataset/'
+TRAIN_DIR = None
+PREDICT_DIR = None
 
 is_training = True
 batch_size_global = 100
 training_steps_list = [15000, 3000]
 learning_rates_list = [0.001, 0.0001]
+step_to_calculate_validation = 20
 # silence testing unknown validation 百分比都是10
 validation_percentage =10
 testing_percentage =10
 silence_percentage =10
 unknow_percentage =10
-
 
 model_settings = {
         'desired_samples': 16000,  # 每个数据多少点
@@ -29,15 +32,10 @@ model_settings = {
         'fingerprint_size': 40 + int((16000 - 480) / 160) * 40,  # 处理后每个样本多少点
         'label_count': 12,
         'sample_rate': 16000,
-    }
-
+}
 whole_words = ['silence', 'unknown', 'yes', 'no', 'up', 'down', 'left', 'right', 'on', 'off', 'stop', 'go']
 word_to_index = {'silence':0, 'unknown':1 , 'yes': 2, 'no': 3, 'up': 4, 'down': 5, 'left': 6, 'right': 7, 'on': 8, 'off': 9, 'stop': 10, 'go': 11}
-
 index_to_word = {0: 'silence', 1: 'unknown', 2: 'yes', 3: 'no', 4: 'up', 5: 'down', 6: 'left', 7: 'right', 8: 'on', 9: 'off', 10: 'stop', 11: 'go'}
-
-
-
 
 
 def run(args):
@@ -52,8 +50,8 @@ def run(args):
     fingerprint_size = model_settings['fingerprint_size']
     fingerprint_input = tf.placeholder(
         tf.float32, [None, fingerprint_size], name='fingerprint_input')
-    logits, dropout_prob = models.generate_fc_model(fingerprint_input, model_settings, is_training=True)
-    label_count = model_settings['label_count']
+    # logits, dropout_prob = models.generate_fc_model(fingerprint_input, model_settings, is_training=True)
+    logits, dropout_prob = models.create_conv_model(fingerprint_input, model_settings, is_training=True)
     time_shift_samples = int((100 * 16000) / 1000)
 
 
@@ -76,16 +74,27 @@ def run(args):
     correct_prediction = tf.equal(predicted_indices, ground_truth_input)
     evaluation_step = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
     tf.summary.scalar('accuracy', evaluation_step)
+
+    global_step = tf.train.get_or_create_global_step()
+    increment_global_step = tf.assign(global_step, global_step + 1)
+
+
+    saver = tf.train.Saver(tf.global_variables())
     merged_summaries = tf.summary.merge_all()
     train_writer = tf.summary.FileWriter('/tmp/train', sess.graph)
     validation_writer = tf.summary.FileWriter('/tmp/validation')
 
     tf.global_variables_initializer().run()
 
+    start_step = 1
+    if args.start_checkpoint:
+        saver = tf.train.Saver(tf.global_variables())
+        saver.restore(sess, args.start_checkpoint)
+        start_step = global_step.eval(session=sess)
 
     #####################Training process##########################
     training_steps_max = np.sum(training_steps_list)
-    for training_step in range(1, training_steps_max + 1):
+    for training_step in range(start_step, training_steps_max + 1):
         # Figure out what the current learning rate is.
         training_steps_sum = 0
         for i in range(len(training_steps_list)):
@@ -102,9 +111,9 @@ def run(args):
                                                                wav_filename_placeholder_,"training")
 
         # Run the graph with this batch of training data.
-        train_summary, train_accuracy, cross_entropy_value, _ = sess.run(
+        train_summary, train_accuracy, cross_entropy_value, _, _= sess.run(
             [
-                merged_summaries, evaluation_step, cross_entropy_mean, train_step
+                merged_summaries, evaluation_step, cross_entropy_mean, train_step,increment_global_step
             ],
             feed_dict={
                 fingerprint_input: train_fingerprints,
@@ -118,7 +127,7 @@ def run(args):
                          cross_entropy_value))
 
         is_last_step = (training_step == training_steps_max)
-        if (training_step % 100) == 0 or is_last_step:
+        if (training_step % step_to_calculate_validation) == 0 or is_last_step:
             set_size = len(data_index['validation'])
             total_accuracy = 0
             for i in range(0, set_size, batch_size_global):
@@ -138,11 +147,14 @@ def run(args):
                         ground_truth_input: validation_ground_truth,
                         dropout_prob: 1.0
                     })
-                validation_writer.add_summary(validation_summary, training_step)
+                # validation_writer.add_summary(validation_summary, training_step)
                 actural_size = min(batch_size_global, set_size - i)
                 total_accuracy += (validation_accuracy * actural_size) / set_size
             tf.logging.info('Step %d: Validation accuracy = %.1f%% (N=%d)' %
                             (training_step, total_accuracy * 100, set_size))
+
+            tf.logging.info('Saving to "%s-%d"', args.checkpoint_path, training_step)
+            saver.save(sess, args.checkpoint_path, global_step=training_step)
 
 
     #########get result after training
@@ -186,7 +198,9 @@ def run(args):
     print("prediction lengh is",len(predictions))
     print("file lengh is",len(filenames))
 
-    f = open("/tmp/predictions.txt","w")
+    now = dt.now()
+    time_stamp = now.strftime('%m%d_%H%M')
+    f = open(args.output_folder+"predictions"+time_stamp+".txt","w")
     for f_name,result in zip(filenames,predictions):
         f.write(os.path.basename(f_name)+","+index_to_word[result]+"\n")
     f.close()
@@ -202,7 +216,7 @@ def generate_data(background_data, background_data_placeholder_, background_volu
     batch_size = batch_size_global
     if mode == 'pred':
         candidates=[];
-        for wav_path in tf.gfile.Glob('/tmp/test/audio/*.wav'):
+        for wav_path in tf.gfile.Glob(PREDICT_DIR + '*.wav'):
             candidates.append({'label': 'go', 'file': wav_path })
         batch_size = len(candidates)
     else:
@@ -268,7 +282,7 @@ def generate_data(background_data, background_data_placeholder_, background_volu
 def generate_dataset():
     data_index = {'validation': [], 'testing': [], 'training': []}
     unknown_index = {'validation': [], 'testing': [], 'training': []}
-    search_path = os.path.join(DATA_DIR, '*', '*.wav')
+    search_path = os.path.join(TRAIN_DIR, '*', '*.wav')
     for wav_path in tf.gfile.Glob(search_path):
         _, label = os.path.split(os.path.dirname(wav_path))
         label = label.lower()
@@ -315,13 +329,13 @@ def generate_dataset():
 
 def load_noise_data():
     # 生成背景噪音数据样本
-    background_dir = os.path.join(DATA_DIR, NOISE_FOLDER)
+    background_dir = os.path.join(TRAIN_DIR, NOISE_FOLDER)
     background_data=[]
     with tf.Session(graph=tf.Graph()) as sess1:
         wav_filename_placeholder = tf.placeholder(tf.string, [])
         wav_loader = io_ops.read_file(wav_filename_placeholder)
         wav_decoder = contrib_audio.decode_wav(wav_loader, desired_channels=1)
-        search_path = os.path.join(DATA_DIR, NOISE_FOLDER, '*.wav')
+        search_path = os.path.join(TRAIN_DIR, NOISE_FOLDER, '*.wav')
         for wav_path in tf.gfile.Glob(search_path):
             wav_data = sess1.run(
                 wav_decoder,
@@ -375,11 +389,17 @@ def build_data_generator():
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description="""My audio recognizer tainer
-    You need manually uncompress the training data and put the folder into DATA_PATH    
+    You need manually uncompress the training data and prediction data put the folder into DATA_PATH    
     """)
-    ap.add_argument('--data_path', '-dp', default="/tmp/speech_dataset/")
+    ap.add_argument('--training_data_path', '-td', default='/Users/hchan/ML/tsrc/speech_dataset/')
+    ap.add_argument('--prediction_data_path', '-pd', default='/Users/hchan/ML/tsrc/test/audio/')
+    ap.add_argument('--output_folder', '-of', default='/Users/hchan/ML/tsrc/results/')
+    ap.add_argument('--checkpoint_path', '-cp', default='/Users/hchan/ML/tsrc/ckpt/xxx.ckpt')
+    ap.add_argument('--start_checkpoint', default='',help="The full path of the checkpoint file. a example could be /Users/hchan/ML/tsrc/ckpt/xxx.ckpt-60")
+
     args = ap.parse_args()
-    DATA_DIR = args.data_path
+    TRAIN_DIR = args.training_data_path
+    PREDICT_DIR = args.prediction_data_path
     run(args);
 
 
