@@ -16,7 +16,7 @@ is_training = True
 batch_size_global = 100
 training_steps_list = [15000, 3000]
 learning_rates_list = [0.001, 0.0001]
-step_to_calculate_validation = 20
+step_to_calculate_validation = 500
 # silence testing unknown validation 百分比都是10
 validation_percentage =10
 testing_percentage =10
@@ -137,7 +137,7 @@ def run(args):
                                                                        time_shift_offset_placeholder_,
                                                                        time_shift_padding_placeholder_,
                                                                        time_shift_samples,
-                                                                       wav_filename_placeholder_, "validation")
+                                                                       wav_filename_placeholder_, "validation",i)
                 # Run a validation step and capture training summaries for TensorBoard
                 # with the `merged` op.
                 validation_summary, validation_accuracy = sess.run(
@@ -161,14 +161,14 @@ def run(args):
     test_set_size = len(data_index['testing'])
     tf.logging.info('test_set_size=%d', test_set_size)
     total_accuracy = 0
-    for i in range(0, set_size, batch_size_global):
+    for i in range(0, test_set_size, batch_size_global):
         test_fingerprints, test_ground_truth,filenames = generate_data(background_data, background_data_placeholder_,
                                                                      background_volume_placeholder_, data_index,
                                                                      foreground_volume_placeholder_, mfcc_, sess,
                                                                      time_shift_offset_placeholder_,
                                                                      time_shift_padding_placeholder_,
                                                                      time_shift_samples,
-                                                                     wav_filename_placeholder_, "testing")
+                                                                     wav_filename_placeholder_, "testing",i)
         test_accuracy = sess.run(
             evaluation_step,
             feed_dict={
@@ -176,51 +176,48 @@ def run(args):
                 ground_truth_input: test_ground_truth,
                 dropout_prob: 1.0
             })
-        actual_size = min(batch_size_global, set_size - i)
-        total_accuracy += (test_accuracy * actual_size) / set_size
+        actual_size = min(batch_size_global, test_set_size - i)
+        total_accuracy += (test_accuracy * actual_size) / test_set_size
     tf.logging.info('Final test accuracy = %.1f%% (N=%d)' % (total_accuracy * 100,
-                                                             set_size))
-
-    pred_fingerprints, _, filenames = generate_data(background_data, background_data_placeholder_,
-                                                                    background_volume_placeholder_, data_index,
-                                                                    foreground_volume_placeholder_, mfcc_, sess,
-                                                                    time_shift_offset_placeholder_,
-                                                                    time_shift_padding_placeholder_,
-                                                                    time_shift_samples,
-                                                                    wav_filename_placeholder_, "pred")
-    predictions = sess.run(
-        predicted_indices,
-        feed_dict={
-            fingerprint_input: pred_fingerprints,
-            dropout_prob: 1.0
-        })
-
-    print("prediction lengh is",len(predictions))
-    print("file lengh is",len(filenames))
+                                                             test_set_size))
 
     now = dt.now()
     time_stamp = now.strftime('%m%d_%H%M')
-    f = open(args.output_folder+"predictions"+time_stamp+".txt","w")
-    for f_name,result in zip(filenames,predictions):
-        f.write(os.path.basename(f_name)+","+index_to_word[result]+"\n")
+    f = open(args.output_folder + "predictions" + time_stamp + ".txt", "w")
+    f.write("fname,label\n")
+    pred_set_size = len(data_index['pred'])
+    for i in range(0, pred_set_size, batch_size_global):
+        print("==predicting No.{}".format(i))
+        pred_fingerprints, _, filenames = generate_data(background_data, background_data_placeholder_,
+                                                                        background_volume_placeholder_, data_index,
+                                                                        foreground_volume_placeholder_, mfcc_, sess,
+                                                                        time_shift_offset_placeholder_,
+                                                                        time_shift_padding_placeholder_,
+                                                                        time_shift_samples,
+                                                                        wav_filename_placeholder_, "pred",i)
+        predictions = sess.run(
+            predicted_indices,
+            feed_dict={
+                fingerprint_input: pred_fingerprints,
+                dropout_prob: 1.0
+            })
+
+
+
+        for f_name,result in zip(filenames,predictions):
+            f.write(os.path.basename(f_name)+","+index_to_word[result]+"\n")
     f.close()
 
 def generate_data(background_data, background_data_placeholder_, background_volume_placeholder_, data_index,
                   foreground_volume_placeholder_, mfcc_, sess, time_shift_offset_placeholder_,
-                  time_shift_padding_placeholder_, time_shift_samples, wav_filename_placeholder_ ,mode):
+                  time_shift_padding_placeholder_, time_shift_samples, wav_filename_placeholder_ ,mode,start_point=0):
     ####################### Pull the audio samples we'll use for training.
     background_volume_range = 0.1
     background_frequency = 0.8
     use_background = (mode == 'training')
     # Pick one of the partitions to choose samples from.
     batch_size = batch_size_global
-    if mode == 'pred':
-        candidates=[];
-        for wav_path in tf.gfile.Glob(PREDICT_DIR + '*.wav'):
-            candidates.append({'label': 'go', 'file': wav_path })
-        batch_size = len(candidates)
-    else:
-        candidates = data_index[mode]
+    candidates = data_index[mode]
     # Data and labels will be populated and returned.
     data = np.zeros((batch_size, model_settings['fingerprint_size']))
     labels = np.zeros(batch_size)
@@ -229,7 +226,10 @@ def generate_data(background_data, background_data_placeholder_, background_volu
     pick_deterministically = (mode != 'training')
     for i in range(batch_size):
         if pick_deterministically:
-            sample=candidates[i]
+            if i+start_point<len(candidates):
+                sample=candidates[i+start_point]
+            else:
+                break
         else:
             sample_index = np.random.randint(len(candidates))
             sample = candidates[sample_index]
@@ -280,7 +280,7 @@ def generate_data(background_data, background_data_placeholder_, background_volu
 
 # 数据处理
 def generate_dataset():
-    data_index = {'validation': [], 'testing': [], 'training': []}
+    data_index = {'validation': [], 'testing': [], 'training': [],'pred':[]}
     unknown_index = {'validation': [], 'testing': [], 'training': []}
     search_path = os.path.join(TRAIN_DIR, '*', '*.wav')
     for wav_path in tf.gfile.Glob(search_path):
@@ -323,6 +323,9 @@ def generate_dataset():
     # Make sure the ordering is random.
     for set_index in ['validation', 'testing', 'training']:
         random.shuffle(data_index[set_index])
+
+    for wav_path in tf.gfile.Glob(PREDICT_DIR + '*.wav'):
+        data_index['pred'].append({'label': 'go', 'file': wav_path }) #the label here is useless
 
     return data_index
 
